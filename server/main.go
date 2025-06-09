@@ -9,17 +9,17 @@ import (
 	"github.com/bluenviron/gortsplib/v4/pkg/format/rtph264"
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h264"
 	"github.com/pion/rtp"
-	"github.com/pion/webrtc/v3"
-	"io"
+	"github.com/pion/webrtc/v4"
+	"image"
+	"image/jpeg"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 
-	"github.com/deepch/vdk/av"
-	"github.com/deepch/vdk/codec/h264parser"
-	"github.com/deepch/vdk/format/rtsp"
-	"github.com/pion/webrtc/v3/pkg/media"
+	"github.com/pion/webrtc/v4/pkg/media"
 )
 
 var (
@@ -90,7 +90,7 @@ func main() {
 		panic(err)
 	}
 
-	go rtspConsumer1()
+	go rtspConsumer()
 
 	http.Handle("/", http.FileServer(http.Dir("./static")))
 	http.HandleFunc("/doSignaling", doSignaling)
@@ -100,75 +100,9 @@ func main() {
 }
 
 // The RTSP URL that will be streamed
-const rtspURL = "rtsp://admin:admin@192.168.1.5:554/live"
-
-// Connect to an RTSP URL and pull media.
-// Convert H264 to Annex-B, then write to outboundVideoTrack which sends to all PeerConnections
-func rtspConsumer() {
-	annexbNALUStartCode := func() []byte { return []byte{0x00, 0x00, 0x00, 0x01} }
-
-	for {
-		session, err := rtsp.Dial(rtspURL)
-		if err != nil {
-			panic(err)
-		}
-		session.RtpKeepAliveTimeout = 10 * time.Second
-
-		codecs, err := session.Streams()
-		if err != nil {
-			panic(err)
-		}
-		for i, t := range codecs {
-			log.Println("Stream", i, "is of type", t.Type().String())
-		}
-		if codecs[0].Type() != av.H264 {
-			panic("RTSP feed must begin with a H264 codec")
-		}
-		if len(codecs) != 1 {
-			log.Println("Ignoring all but the first stream.")
-		}
-
-		var previousTime time.Duration
-		for {
-			pkt, err := session.ReadPacket()
-			if err != nil {
-				break
-			}
-
-			if pkt.Idx != 0 {
-				//audio or other stream, skip it
-				continue
-			}
-
-			pkt.Data = pkt.Data[4:]
-
-			// For every key-frame pre-pend the SPS and PPS
-			if pkt.IsKeyFrame {
-				pkt.Data = append(annexbNALUStartCode(), pkt.Data...)
-				pkt.Data = append(codecs[0].(h264parser.CodecData).PPS(), pkt.Data...)
-				pkt.Data = append(annexbNALUStartCode(), pkt.Data...)
-				pkt.Data = append(codecs[0].(h264parser.CodecData).SPS(), pkt.Data...)
-				pkt.Data = append(annexbNALUStartCode(), pkt.Data...)
-			}
-
-			bufferDuration := pkt.Time - previousTime
-			previousTime = pkt.Time
-			if err = outboundVideoTrack.WriteSample(media.Sample{Data: pkt.Data, Duration: bufferDuration}); err != nil && err != io.ErrClosedPipe {
-				panic(err)
-			}
-		}
-
-		if err = session.Close(); err != nil {
-			log.Println("session Close error", err)
-		}
-
-		time.Sleep(5 * time.Second)
-	}
-}
-
 var annexBStartCode = []byte{0x00, 0x00, 0x00, 0x01}
 
-func rtspConsumer1() {
+func rtspConsumer() {
 	// Define the RTSP source
 	rtspURL := "rtsp://admin:admin@192.168.1.5:554/live"
 
@@ -215,7 +149,21 @@ func rtspConsumer1() {
 			time.Sleep(5 * time.Second)
 			continue
 		}
+		// setup H264 -> RGBA decoder
+		h264Dec := &h264Decoder{}
+		err = h264Dec.initialize()
+		if err != nil {
+			panic(err)
+		}
+		defer h264Dec.close()
 
+		// if SPS and PPS are present into the SDP, send them to the decoder
+		if forma.SPS != nil {
+			h264Dec.decode([][]byte{forma.SPS})
+		}
+		if forma.PPS != nil {
+			h264Dec.decode([][]byte{forma.PPS})
+		}
 		// Store SPS and PPS
 		sps := forma.SPS
 		pps := forma.PPS
@@ -229,6 +177,7 @@ func rtspConsumer1() {
 
 		var lastTime time.Time
 		firstRandomAccess := false
+		saveCount := 0
 		client.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
 			au, err := rtpDec.Decode(pkt)
 			if err != nil {
@@ -272,6 +221,23 @@ func rtspConsumer1() {
 			if err != nil {
 				log.Println("WriteSample error:", err)
 			}
+			//
+			// convert H264 access units into RGBA frames
+			img, err := h264Dec.decode(au)
+			if err != nil {
+				panic(err)
+			}
+
+			saveCount++
+			if saveCount < 5 {
+				err = saveToFile(img)
+				if err != nil {
+					panic(err)
+				}
+			} else {
+				fmt.Println(saveCount, img.Bounds().Max)
+			}
+
 		})
 
 		_, err = client.Play(nil)
@@ -288,4 +254,20 @@ func rtspConsumer1() {
 
 		time.Sleep(5 * time.Second)
 	}
+}
+func saveToFile(img image.Image) error {
+	// create file
+	fname := strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10) + ".jpg"
+	f, err := os.Create(fname)
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+
+	log.Println("saving", fname)
+
+	// convert to jpeg
+	return jpeg.Encode(f, img, &jpeg.Options{
+		Quality: 60,
+	})
 }
