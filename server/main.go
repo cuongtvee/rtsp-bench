@@ -3,49 +3,29 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/bluenviron/gortsplib/v4"
+	"github.com/bluenviron/gortsplib/v4/pkg/base"
+	"github.com/bluenviron/gortsplib/v4/pkg/format"
+	"github.com/bluenviron/gortsplib/v4/pkg/format/rtph264"
+	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h264"
+	"github.com/pion/rtp"
+	"github.com/pion/webrtc/v3"
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"sync/atomic"
 	"time"
 
 	"github.com/deepch/vdk/av"
 	"github.com/deepch/vdk/codec/h264parser"
 	"github.com/deepch/vdk/format/rtsp"
-	"github.com/pion/webrtc/v3"
 	"github.com/pion/webrtc/v3/pkg/media"
-	"github.com/shirou/gopsutil/cpu"
 )
 
 var (
 	outboundVideoTrack  *webrtc.TrackLocalStaticSample
 	peerConnectionCount int64
 )
-
-// Generate CSV with columns of timestamp, peerConnectionCount, and cpuUsage
-func reportBuilder() {
-	file, err := os.OpenFile("report.csv", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		panic(err)
-	}
-
-	if _, err := file.WriteString("timestamp, peerConnectionCount, cpuUsage\n"); err != nil {
-		panic(err)
-	}
-
-	for range time.NewTicker(3 * time.Second).C {
-		usage, err := cpu.Percent(0, false)
-		if err != nil {
-			panic(err)
-		} else if len(usage) != 1 {
-			panic(fmt.Sprintf("CPU Usage results should have 1 sample, have %d", len(usage)))
-		}
-		if _, err = file.WriteString(fmt.Sprintf("%s, %d, %f\n", time.Now().Format(time.RFC3339), atomic.LoadInt64(&peerConnectionCount), usage[0])); err != nil {
-			panic(err)
-		}
-	}
-}
 
 // HTTP Handler that accepts an Offer and returns an Answer
 // adds outboundVideoTrack to PeerConnection
@@ -110,8 +90,7 @@ func main() {
 		panic(err)
 	}
 
-	go rtspConsumer()
-	go reportBuilder()
+	go rtspConsumer1()
 
 	http.Handle("/", http.FileServer(http.Dir("./static")))
 	http.HandleFunc("/doSignaling", doSignaling)
@@ -121,7 +100,7 @@ func main() {
 }
 
 // The RTSP URL that will be streamed
-const rtspURL = "rtsp://170.93.143.139:1935/rtplive/0b01b57900060075004d823633235daa"
+const rtspURL = "rtsp://admin:admin@192.168.1.5:554/live"
 
 // Connect to an RTSP URL and pull media.
 // Convert H264 to Annex-B, then write to outboundVideoTrack which sends to all PeerConnections
@@ -182,6 +161,130 @@ func rtspConsumer() {
 		if err = session.Close(); err != nil {
 			log.Println("session Close error", err)
 		}
+
+		time.Sleep(5 * time.Second)
+	}
+}
+
+var annexBStartCode = []byte{0x00, 0x00, 0x00, 0x01}
+
+func rtspConsumer1() {
+	// Define the RTSP source
+	rtspURL := "rtsp://admin:admin@192.168.1.5:554/live"
+
+	for {
+		trs := gortsplib.TransportTCP
+		client := &gortsplib.Client{
+			Transport: &trs,
+		}
+
+		u, err := base.ParseURL(rtspURL)
+		if err != nil {
+			log.Println("Failed to parse RTSP URL:", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		if err := client.Start(u.Scheme, u.Host); err != nil {
+			log.Println("Failed to connect to RTSP server:", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		desc, _, err := client.Describe(u)
+		if err != nil {
+			log.Println("Failed to describe RTSP stream:", err)
+			client.Close()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		var forma *format.H264
+		medi := desc.FindFormat(&forma)
+		if medi == nil {
+			log.Println("No H264 media found in stream")
+			client.Close()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		rtpDec, err := forma.CreateDecoder()
+		if err != nil {
+			log.Println("Failed to create RTP decoder:", err)
+			client.Close()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		// Store SPS and PPS
+		sps := forma.SPS
+		pps := forma.PPS
+
+		if _, err := client.Setup(desc.BaseURL, medi, 0, 0); err != nil {
+			log.Println("Setup failed:", err)
+			client.Close()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		var lastTime time.Time
+		firstRandomAccess := false
+		client.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
+			au, err := rtpDec.Decode(pkt)
+			if err != nil {
+				if err != rtph264.ErrNonStartingPacketAndNoPrevious &&
+					err != rtph264.ErrMorePacketsNeeded {
+					log.Println("Decode error:", err)
+				}
+				return
+			}
+
+			// wait for a random access unit
+			if !firstRandomAccess && !h264.IsRandomAccess(au) {
+				log.Printf("waiting for a random access unit")
+				return
+			}
+			firstRandomAccess = true
+
+			// Convert to Annex-B format
+			nalus := au
+			var annexb []byte
+			if sps != nil && pps != nil {
+				annexb = append(annexb, annexBStartCode...)
+				annexb = append(annexb, sps...)
+				annexb = append(annexb, annexBStartCode...)
+				annexb = append(annexb, pps...)
+			}
+			for _, nalu := range nalus {
+				annexb = append(annexb, annexBStartCode...)
+				annexb = append(annexb, nalu...)
+			}
+
+			// Write to WebRTC track
+			now := time.Now()
+			duration := now.Sub(lastTime)
+			lastTime = now
+
+			err = outboundVideoTrack.WriteSample(media.Sample{
+				Data:     annexb,
+				Duration: duration,
+			})
+			if err != nil {
+				log.Println("WriteSample error:", err)
+			}
+		})
+
+		_, err = client.Play(nil)
+		if err != nil {
+			log.Println("Play failed:", err)
+			client.Close()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		log.Println("RTSP client started")
+		err = client.Wait()
+		log.Println("RTSP client ended:", err)
 
 		time.Sleep(5 * time.Second)
 	}
