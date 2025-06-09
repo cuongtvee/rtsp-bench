@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"github.com/bluenviron/gortsplib/v4"
 	"github.com/bluenviron/gortsplib/v4/pkg/base"
+	"github.com/bluenviron/gortsplib/v4/pkg/description"
 	"github.com/bluenviron/gortsplib/v4/pkg/format"
 	"github.com/bluenviron/gortsplib/v4/pkg/format/rtph264"
+	"github.com/bluenviron/gortsplib/v4/pkg/format/rtpmjpeg"
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h264"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
@@ -81,7 +85,42 @@ func doSignaling(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func multiplyAndDivide(v, m, d int64) int64 {
+	secs := v / d
+	dec := v % d
+	return (secs*m + dec*m/d)
+}
+
+func randUint32() (uint32, error) {
+	var b [4]byte
+	_, err := rand.Read(b[:])
+	if err != nil {
+		return 0, err
+	}
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3]), nil
+}
+
+var rtspServer *server
+var enc *rtpmjpeg.Encoder
+var desc1 *description.Session
+var jforma = &format.MJPEG{}
+
 func main() {
+	rtspServer = &server{}
+	rtspServer.initialize()
+	// create a RTSP description that contains a H264 format
+
+	desc1 = &description.Session{
+		Medias: []*description.Media{{
+			Type:    description.MediaTypeVideo,
+			Formats: []format.Format{jforma},
+		}},
+	}
+	rtspServer.stream = &gortsplib.ServerStream{
+		Server: rtspServer.server,
+		Desc:   desc1,
+	}
+	enc, _ = jforma.CreateEncoder()
 	var err error
 	outboundVideoTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
 		MimeType: "video/h264",
@@ -89,14 +128,26 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	rtspServer.server.Start()
+	err = rtspServer.stream.Initialize()
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
 
 	go rtspConsumer()
 
 	http.Handle("/", http.FileServer(http.Dir("./static")))
 	http.HandleFunc("/doSignaling", doSignaling)
 
-	fmt.Println("Open http://localhost:8080 to access this demo")
-	panic(http.ListenAndServe(":8080", nil))
+	go func() {
+		fmt.Println("Open http://localhost:8080 to access this demo")
+		panic(http.ListenAndServe(":8080", nil))
+	}()
+	err = rtspServer.server.Wait()
+	if err != nil {
+		panic(err)
+	}
 }
 
 // The RTSP URL that will be streamed
@@ -177,7 +228,10 @@ func rtspConsumer() {
 
 		var lastTime time.Time
 		firstRandomAccess := false
-		saveCount := 0
+		//saveCount := 0
+
+		start := time.Now()
+		randomStart, err := randUint32()
 		client.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
 			au, err := rtpDec.Decode(pkt)
 			if err != nil {
@@ -228,14 +282,38 @@ func rtspConsumer() {
 				panic(err)
 			}
 
-			saveCount++
-			if saveCount < 5 {
-				err = saveToFile(img)
+			//saveCount++
+			//if saveCount < 5 {
+			//	err = saveToFile(img)
+			//	if err != nil {
+			//		panic(err)
+			//	}
+			//} else {
+			//	fmt.Println(saveCount, img.Bounds().Max)
+			//}
+			pts := multiplyAndDivide(int64(time.Since(start)), int64(jforma.ClockRate()), int64(time.Second))
+			var buf bytes.Buffer
+			err = jpeg.Encode(&buf, img, &jpeg.Options{Quality: 80})
+			if err != nil {
+				panic(err)
+			}
+
+			// generate RTP packets from the JPEG image
+			pkts, err := enc.Encode(buf.Bytes())
+			if err != nil {
+				panic(err)
+			}
+
+			log.Printf("writing RTP packets with PTS=%d, jpeg size=%d, pkt count=%d", pts, buf.Len(), len(pkts))
+
+			// write RTP packets to the server
+			for _, pk := range pkts {
+				pk.Timestamp += uint32(int64(randomStart) + pts)
+
+				err = rtspServer.stream.WritePacketRTP(desc1.Medias[0], pk)
 				if err != nil {
 					panic(err)
 				}
-			} else {
-				fmt.Println(saveCount, img.Bounds().Max)
 			}
 
 		})
